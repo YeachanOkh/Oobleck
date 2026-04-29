@@ -71,7 +71,7 @@ def main(
     tokenizer = GPT2TokenizerFast.from_pretrained(model_name_or_path)
     tokenizer.pad_token = tokenizer.eos_token
 
-    dataset = datasets.load_dataset("wikitext", "wikitext-2-raw-v1")["train"]
+    dataset = datasets.load_dataset("karpathy/tiny_shakespeare")["train"]
     dataloader: HeterogeneousDataLoader = plugin.prepare_dataloader(
         dataset,
         shuffle=True,
