@@ -6,10 +6,18 @@ Launch with torchrun:
 
 For a fair comparison with the Oobleck run_gpt2.py script, match
 --global_batch_size, --num_epoch, and --model_name_or_path.
+
+Fault simulation:
+  Kill a worker with: kill -9 <worker_pid>
+  For fast NCCL fault detection set these env vars before launching:
+    TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=30
+    TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 """
 
+import csv
 import functools
 import os
+import time
 
 import click
 import datasets
@@ -53,12 +61,19 @@ def tokenize_batch_for_pretrain(
 @click.option("--microbatch_size", type=int, default=2, help="Per-GPU batch size.")
 @click.option("--num_epoch", type=int, default=3, help="Number of epochs.")
 @click.option("--warmup_fraction", type=float, default=0.1, help="Warmup fraction.")
+@click.option(
+    "--metrics_file",
+    type=str,
+    default="ddp_metrics.csv",
+    help="Path for CSV metrics output.",
+)
 def main(
     model_name_or_path: str,
     global_batch_size: int,
     microbatch_size: int,
     num_epoch: int,
     warmup_fraction: float,
+    metrics_file: str,
 ):
     # ── Distributed setup ────────────────────────────────────────────────────
     dist.init_process_group(backend="nccl")
@@ -112,6 +127,17 @@ def main(
     # ── Mixed precision ───────────────────────────────────────────────────────
     scaler = torch.cuda.amp.GradScaler()
 
+    # ── Metrics logging setup ─────────────────────────────────────────────────
+    max_seq_len = config.max_position_embeddings
+    global_step = 0
+    train_start = time.time()
+
+    if is_main:
+        with open(metrics_file, "w", newline="") as _f:
+            csv.writer(_f).writerow(
+                ["wall_time", "step", "epoch", "loss", "tokens_per_sec", "event"]
+            )
+
     # ── Training loop ─────────────────────────────────────────────────────────
     model.train()
     for epoch in range(num_epoch):
@@ -125,22 +151,43 @@ def main(
             disable=not is_main,
         ) as pbar:
             for step, batch in pbar:
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                    outputs = model(**batch)
-                    loss = outputs.loss / grad_accum_steps
+                t0 = time.time()
+                try:
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                        outputs = model(**batch)
+                        loss = outputs.loss / grad_accum_steps
 
-                scaler.scale(loss).backward()
+                    scaler.scale(loss).backward()
 
-                if (step + 1) % grad_accum_steps == 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    lr_scheduler.step()
-                    optimizer.zero_grad()
+                    if (step + 1) % grad_accum_steps == 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                        lr_scheduler.step()
+                        optimizer.zero_grad()
 
+                except Exception:
+                    t_crash = time.time()
+                    if is_main:
+                        with open(metrics_file, "a", newline="") as _f:
+                            csv.writer(_f).writerow(
+                                [round(t_crash - train_start, 4), global_step, epoch, "", "", "crash"]
+                            )
+                    raise
+
+                t1 = time.time()
                 if is_main:
-                    pbar.set_postfix(loss=loss.item() * grad_accum_steps)
+                    loss_val = loss.item() * grad_accum_steps
+                    tokens_per_sec = microbatch_size * world_size * max_seq_len / max(t1 - t0, 1e-9)
+                    with open(metrics_file, "a", newline="") as _f:
+                        csv.writer(_f).writerow(
+                            [round(t1 - train_start, 4), global_step, epoch,
+                             round(loss_val, 6), round(tokens_per_sec, 2), "step"]
+                        )
+                    pbar.set_postfix(loss=loss_val)
+
+                global_step += 1
 
     dist.destroy_process_group()
 

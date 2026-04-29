@@ -1,4 +1,6 @@
+import csv
 import functools
+import time
 
 import click
 import datasets
@@ -44,12 +46,19 @@ def tokenize_batch_for_pretrain(
 @click.option("--num_epoch", type=int, default=3, help="Number of epochs.")
 @click.option("--warmup_faction", type=float, default=0.1, help="Warmup faction.")
 @click.option("--tp_size", type=int, default=1, help="Tensor parallel degree.")
+@click.option(
+    "--metrics_file",
+    type=str,
+    default="singlenode_metrics.csv",
+    help="Path for CSV metrics output.",
+)
 def main(
     model_name_or_path: str,
     global_batch_size: int,
     num_epoch: int,
     warmup_faction: float,
     tp_size: int,
+    metrics_file: str,
 ):
     plugin = OobleckPlugin(
         tp_size=tp_size,
@@ -109,6 +118,15 @@ def main(
     dataloader_iter = iter(dataloader)
 
     is_pp_last_stage = engine.plugin.stage_manager.is_last_stage()
+    max_seq_len = model.config.max_position_embeddings
+    global_step = 0
+    train_start = time.time()
+
+    if is_pp_last_stage:
+        with open(metrics_file, "w", newline="") as _f:
+            csv.writer(_f).writerow(
+                ["wall_time", "step", "epoch", "loss", "tokens_per_sec", "event"]
+            )
 
     for epoch in range(num_epoch):
         total_step = len(dataloader)
@@ -119,6 +137,7 @@ def main(
             disable=not (engine.is_master or is_pp_last_stage),
         ) as pbar:
             for _ in pbar:
+                t0 = time.time()
                 outputs = engine.execute(
                     dataloader_iter,
                     model,
@@ -127,20 +146,40 @@ def main(
                     return_loss=True,
                     return_outputs=False,
                 )
+                t1 = time.time()
 
                 if outputs is None:
+                    if is_pp_last_stage:
+                        with open(metrics_file, "a", newline="") as _f:
+                            csv.writer(_f).writerow(
+                                [round(t1 - train_start, 4), global_step, epoch, "", "", "fault_detected"]
+                            )
                     # Reconfiguration due to failure is done.
                     model, optimizer, dataloader = engine.reconfigure(
                         model, optimizer, dataloader
                     )
+                    t_recovered = time.time()
+                    if is_pp_last_stage:
+                        with open(metrics_file, "a", newline="") as _f:
+                            csv.writer(_f).writerow(
+                                [round(t_recovered - train_start, 4), global_step, epoch, "", "", "recovered"]
+                            )
                     logger.warning("Reconfiguration is done. Restarting training.")
                     dataloader_iter = iter(dataloader)
                     continue
 
                 if is_pp_last_stage:
                     loss = outputs["loss"]
-                    pbar.set_postfix({"loss": loss.item()})
+                    loss_val = loss.item()
+                    tokens_per_sec = global_batch_size * max_seq_len / max(t1 - t0, 1e-9)
+                    with open(metrics_file, "a", newline="") as _f:
+                        csv.writer(_f).writerow(
+                            [round(t1 - train_start, 4), global_step, epoch,
+                             round(loss_val, 6), round(tokens_per_sec, 2), "step"]
+                        )
+                    pbar.set_postfix({"loss": loss_val})
 
+                global_step += 1
                 optimizer.step()
                 optimizer.zero_grad()
                 lr_scheduler.step()
